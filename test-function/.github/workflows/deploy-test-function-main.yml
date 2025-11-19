@@ -18,8 +18,8 @@ jobs:
         uses: montudor/action-zip@v1
 
       - name: Create zip file for Lambda code
-        working-directory: ./Users/thati/OneDrive/Documents/ninepoint-st-lambdas/test-function
-        run: zip -r ../Users/thati/OneDrive/Documents/ninepoint-st-lambdas/test-function.zip .
+        working-directory: ./test-function
+        run: zip -r ../test-function.zip .
 
       - name: AWS CLI v2
         uses: imehedi/actions-awscli-v2@latest
