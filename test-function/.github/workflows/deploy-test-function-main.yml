@@ -5,7 +5,7 @@ on:
     branches: [ main ]
     paths:
       - 'test-function/**'
-      - '.github/workflows/deploy-test-function-main.yml'
+      - '.github/workflows/deploy-test-function.yml'
 
 jobs:
   deploy:
@@ -17,10 +17,9 @@ jobs:
       - name: Install zip tool
         uses: montudor/action-zip@v1
 
-      # ⬇️ ONLY zip the test-function folder
       - name: Create zip file for Lambda code
         working-directory: ./Users/thati/OneDrive/Documents/ninepoint-st-lambdas/test-function
-        run: zip -r code.zip .
+        run: zip -r ../Users/thati/OneDrive/Documents/ninepoint-st-lambdas/test-function.zip .
 
       - name: AWS CLI v2
         uses: imehedi/actions-awscli-v2@latest
@@ -28,7 +27,7 @@ jobs:
           args: >
             lambda update-function-code
             --function-name arn:aws:lambda:ca-central-1:839358208765:function:test-function
-            --zip-file fileb://test-function/code.zip
+            --zip-file fileb://test-function.zip
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
