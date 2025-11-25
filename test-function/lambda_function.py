@@ -5,214 +5,400 @@ import paramiko
 import tempfile
 import shutil
 import logging
-import time
-from boxsdk import JWTAuth, Client
 
 from logging_utils import (
     log_job_start, log_job_end, log_sftp_connection, log_matched_files,
     log_checksum_ok, log_checksum_fail, log_file_transferred, log_archive,
-    log_tmp_usage, log_warning, log_error, log_box_version
+    log_tmp_usage, log_warning, log_error
 )
 from dry_run_utils import is_dry_run_enabled, log_dry_run_action
 from checksum_utils import log_checksum
 from trace_utils import get_or_create_trace_id
 from file_match_utils import match_files
 from retry_utils import default_retry
-from storage_utils import get_date_subpath, upload_files_to_box_by_date
+from storage_utils import get_date_subpath
 from performance_utils import time_operation
 from metrics_utils import publish_file_transfer_metric, publish_error_metric
 from alert_utils import send_file_transfer_sns_alert
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-logging.getLogger("boxsdk").setLevel(logging.WARNING)
 
-s3_client = boto3.client('s3')
+s3_client = boto3.client("s3")
+secrets_client = boto3.client("secretsmanager")
 
-def get_secret(secret_name):
-    client = boto3.client('secretsmanager')
-    response = client.get_secret_value(SecretId=secret_name)
-    secret = response['SecretString']
-    return json.loads(secret)
 
-def get_file_patterns():
-    val = os.getenv('FILE_PATTERN')
-    if val:
-        return [x.strip() for x in val.split(',') if x.strip()]
-    return ['*']
+def _get_secret_dict(secret_name: str) -> dict:
+    """
+    Fetch connection details from Secrets Manager.
+    Secret is expected to contain JSON with at least:
+      {
+        "Host": "sftp.ninepoint.com",
+        "Username": "appservice",
+        "Password": "********"
+      }
+    """
+    resp = secrets_client.get_secret_value(SecretId=secret_name)
+    secret_str = resp.get("SecretString") or ""
+    try:
+        return json.loads(secret_str)
+    except json.JSONDecodeError:
+        # fall back to single-value secrets if needed
+        return {"value": secret_str}
+
+
+def _get_file_patterns():
+    """
+    Read FILE_PATTERN env var and turn into a list.
+
+    Examples:
+       FILE_PATTERN="CRMEXTHLD.*"
+       FILE_PATTERN="CRMEXTHLD.*,CRMEXTNAV.*"
+    """
+    raw = os.getenv("FILE_PATTERN")
+    if not raw:
+        return ["*"]
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
 
 @default_retry()
-def create_sftp_client(host, port, username, password):
+def _create_sftp_client(host: str, port: int, username: str, password: str) -> paramiko.SFTPClient:
     transport = paramiko.Transport((host, port))
     transport.connect(username=username, password=password)
     return paramiko.SFTPClient.from_transport(transport)
 
+
 @default_retry()
-def download_and_upload_to_s3(sftp_client, remote_dir, bucket, prefix, local_dir, trace_id, job_id, file_patterns, metrics, transfer_status, checksum_status, errors, warnings):
-    all_files = sftp_client.listdir(remote_dir)
+def _process_files_on_sftp(
+    sftp_client: paramiko.SFTPClient,
+    src_dir: str,
+    dest_dir: str,
+    bucket: str,
+    prefix: str,
+    tmp_dir: str,
+    trace_id: str,
+    file_patterns,
+    metrics: dict,
+    transfer_status: dict,
+    checksum_status: dict,
+    errors: list,
+    warnings: list,
+):
+    """
+    Main worker:
+
+    1. List files in src_dir on the SFTP server.
+    2. Filter using FILE_PATTERN.
+    3. For each file:
+       - download from src_dir to /tmp
+       - upload to dest_dir on the SAME SFTP server
+       - upload to S3 under S3_BUCKET/S3_PREFIX/YYYY/MM/DD/
+       - optionally delete from src_dir once both uploads succeed.
+    """
+    src_dir = src_dir.rstrip("/") or "."
+    dest_dir = dest_dir.rstrip("/") or "/"
+
+    all_files = sftp_client.listdir(src_dir)
     files = match_files(all_files, include_patterns=file_patterns)
-    unmatched = set(all_files) - set(files)
-    date_subpath = get_date_subpath()
+    unmatched = sorted(set(all_files) - set(files))
     log_matched_files(trace_id, files, unmatched)
 
-    total_bytes = 0
-    t0 = time.time()
+    if not files:
+        msg = f"No files in {src_dir} matched patterns {file_patterns}; nothing to do."
+        log_warning(trace_id, msg)
+        transfer_status["sftp_move"] = "NO FILES"
+        transfer_status["s3"] = "NO FILES"
+        warnings.append(msg)
+        return
+
+    date_subpath = get_date_subpath()  # "YYYY/MM/DD"
+
+    total_bytes_download = 0
+    total_bytes_upload_sftp = 0
+    total_bytes_upload_s3 = 0
+
+    total_time_download = 0.0
+    total_time_upload_sftp = 0.0
+    total_time_upload_s3 = 0.0
+
+    delete_src = str(os.getenv("DELETE_SOURCE", "true")).lower() == "true"
+
     for filename in files:
-        remote_path = f"{remote_dir}/{filename}"
-        local_path = os.path.join(local_dir, filename)
+        src_path = f"{src_dir}/{filename}"
+        dest_path = f"{dest_dir}/{filename}"
+        local_path = os.path.join(tmp_dir, filename)
 
-        _, duration = time_operation(sftp_client.get, remote_path, local_path)
-        bytes_transferred = os.path.getsize(local_path)
-        total_bytes += bytes_transferred
+        if is_dry_run_enabled():
+            log_dry_run_action(
+                f"Would download {src_path} to {local_path}, "
+                f"then upload to {dest_path} and S3 bucket={bucket} prefix={prefix}/{date_subpath}"
+            )
+            continue
 
-        downloaded_checksum = log_checksum(local_path, trace_id, algo="sha256", note="after SFTP download")
-        s3_upload_checksum = log_checksum(local_path, trace_id, algo="sha256", note="before S3 upload")
+        # --- Download from source folder ---
+        try:
+            logger.info("[%s] Downloading %s from %s to %s",
+                        trace_id, filename, src_path, local_path)
+            _, dl_time = time_operation(sftp_client.get, src_path, local_path)
+        except Exception as e:
+            msg = f"Failed to download {src_path}"
+            log_error(trace_id, msg, exc=e)
+            errors.append(f"{msg}: {e}")
+            continue
+
+        size_bytes = os.path.getsize(local_path)
+        total_bytes_download += size_bytes
+        total_time_download += dl_time
+
+        # checksums around S3 upload (SFTP source and S3 will share the same file)
+        downloaded_checksum = log_checksum(
+            local_path, trace_id, algo="sha256",
+            note="after download from /lti/prod"
+        )
+        s3_upload_checksum = log_checksum(
+            local_path, trace_id, algo="sha256",
+            note="before S3 upload"
+        )
 
         if downloaded_checksum == s3_upload_checksum:
             log_checksum_ok(trace_id, filename, downloaded_checksum)
             checksum_status[filename] = f"OK (sha256: {downloaded_checksum})"
         else:
-            log_checksum_fail(trace_id, filename, downloaded_checksum, s3_upload_checksum)
-            checksum_status[filename] = f"FAIL (downloaded: {downloaded_checksum}, s3: {s3_upload_checksum})"
-
-        s3_key = f"{prefix}/{date_subpath}/{filename}" if prefix else f"{date_subpath}/{filename}"
-
-        # DRY RUN LOGIC HERE
-        if is_dry_run_enabled():
-            log_dry_run_action(f"Would upload {filename} to S3 at {s3_key}")
-        else:
-            _, s3_duration = time_operation(s3_client.upload_file, local_path, bucket, s3_key)
-            log_file_transferred(trace_id, filename, "S3", s3_duration)
-            log_archive(trace_id, filename, s3_key)
-
-    t1 = time.time()
-    download_time = t1 - t0
-    mb = total_bytes / 1024 / 1024 if total_bytes else 0.0
-    mbps = (mb / download_time) if download_time else 0.0
-    metrics["S3 upload speed mb/s"] = f"{mbps:.2f}"
-    metrics["S3 total mb"] = f"{mb:.2f}"
-    metrics["SFTP download speed mb/s"] = f"{mbps:.2f}"
-    metrics["SFTP total mb"] = f"{mb:.2f}"
-
-    transfer_status["s3"] = f"SUCCESS ({', '.join(files)})" if files else "NO FILES"
-    try:
-        if not is_dry_run_enabled():
-            publish_file_transfer_metric(
-                namespace='LambdaFileTransfer',
-                direction='SFTP_TO_S3',
-                file_count=len(files),
-                total_bytes=total_bytes,
-                duration_sec=round(download_time, 2),
-                trace_id=trace_id
+            log_checksum_fail(trace_id, filename,
+                              downloaded_checksum, s3_upload_checksum)
+            checksum_status[filename] = (
+                f"FAIL (downloaded: {downloaded_checksum}, "
+                f"s3: {s3_upload_checksum})"
             )
-    except Exception as e:
-        log_error(trace_id, "CloudWatch metric error for S3 transfer", exc=e)
-        publish_error_metric('LambdaFileTransfer', 'S3MetricError', trace_id)
-        errors.append(str(e))
+
+        # --- Upload to destination folder on same SFTP server ---
+        try:
+            logger.info("[%s] Uploading %s to dest %s",
+                        trace_id, filename, dest_path)
+            _, up_time_sftp = time_operation(sftp_client.put, local_path, dest_path)
+            total_bytes_upload_sftp += size_bytes
+            total_time_upload_sftp += up_time_sftp
+
+            mb = size_bytes / 1024 / 1024 if size_bytes else 0.0
+            mbps = (mb / up_time_sftp) if up_time_sftp else None
+            log_file_transferred(trace_id, filename, "SFTP_MOVE", up_time_sftp, mbps)
+        except Exception as e:
+            msg = f"Failed to upload {local_path} to dest {dest_path}"
+            log_error(trace_id, msg, exc=e)
+            errors.append(f"{msg}: {e}")
+            # don't delete source if move failed for this file
+            continue
+
+        # --- Upload to S3 archive ---
+        s3_key = f"{prefix}/{date_subpath}/{filename}" if prefix else f"{date_subpath}/{filename}"
+        try:
+            logger.info("[%s] Uploading %s to s3://%s/%s",
+                        trace_id, filename, bucket, s3_key)
+            _, up_time_s3 = time_operation(s3_client.upload_file, local_path, bucket, s3_key)
+            total_bytes_upload_s3 += size_bytes
+            total_time_upload_s3 += up_time_s3
+
+            mb = size_bytes / 1024 / 1024 if size_bytes else 0.0
+            mbps = (mb / up_time_s3) if up_time_s3 else None
+            log_file_transferred(trace_id, filename, "S3", up_time_s3, mbps)
+            log_archive(trace_id, filename, s3_key)
+        except Exception as e:
+            msg = f"Failed to upload {local_path} to S3 at {s3_key}"
+            log_error(trace_id, msg, exc=e)
+            errors.append(f"{msg}: {e}")
+            # We still keep the file on dest_dir; treat S3 as independent archive.
+            # Do NOT delete source in this case.
+            continue
+
+        # --- Delete from source directory after successful move + S3 (if configured) ---
+        if delete_src:
+            try:
+                logger.info("[%s] Deleting source file %s", trace_id, src_path)
+                sftp_client.remove(src_path)
+            except Exception as e:
+                msg = f"Failed to delete source file {src_path}"
+                log_error(trace_id, msg, exc=e)
+                warnings.append(f"{msg}: {e}")
+
+    # Aggregate metrics
+    def _calc_speed(total_bytes, total_time):
+        if not total_bytes or not total_time:
+            return 0.0, 0.0
+        mb = total_bytes / 1024 / 1024
+        mbps = mb / total_time if total_time else 0.0
+        return mb, mbps
+
+    mb_dl, mbps_dl = _calc_speed(total_bytes_download, total_time_download)
+    mb_up_sftp, mbps_up_sftp = _calc_speed(total_bytes_upload_sftp, total_time_upload_sftp)
+    mb_up_s3, mbps_up_s3 = _calc_speed(total_bytes_upload_s3, total_time_upload_s3)
+
+    metrics["SFTP download total mb"] = f"{mb_dl:.2f}"
+    metrics["SFTP download speed mb/s"] = f"{mbps_dl:.2f}"
+    metrics["SFTP move total mb"] = f"{mb_up_sftp:.2f}"
+    metrics["SFTP move speed mb/s"] = f"{mbps_up_sftp:.2f}"
+    metrics["S3 upload total mb"] = f"{mb_up_s3:.2f}"
+    metrics["S3 upload speed mb/s"] = f"{mbps_up_s3:.2f}"
+
+    if not is_dry_run_enabled():
+        # CloudWatch metrics for both legs
+        try:
+            if total_bytes_download:
+                publish_file_transfer_metric(
+                    namespace="LambdaFileTransfer",
+                    direction="SFTP_TO_TMP",
+                    file_count=len(files),
+                    total_bytes=total_bytes_download,
+                    duration_sec=round(total_time_download, 2),
+                    trace_id=trace_id,
+                )
+        except Exception as e:
+            log_error(trace_id, "CloudWatch metric error for SFTP download", exc=e)
+            publish_error_metric("LambdaFileTransfer", "SFTPDownloadMetricError", trace_id)
+
+        try:
+            if total_bytes_upload_sftp:
+                publish_file_transfer_metric(
+                    namespace="LambdaFileTransfer",
+                    direction="TMP_TO_SFTP",
+                    file_count=len(files),
+                    total_bytes=total_bytes_upload_sftp,
+                    duration_sec=round(total_time_upload_sftp, 2),
+                    trace_id=trace_id,
+                )
+        except Exception as e:
+            log_error(trace_id, "CloudWatch metric error for SFTP move", exc=e)
+            publish_error_metric("LambdaFileTransfer", "SFTPMoveMetricError", trace_id)
+
+        try:
+            if total_bytes_upload_s3:
+                publish_file_transfer_metric(
+                    namespace="LambdaFileTransfer",
+                    direction="TMP_TO_S3",
+                    file_count=len(files),
+                    total_bytes=total_bytes_upload_s3,
+                    duration_sec=round(total_time_upload_s3, 2),
+                    trace_id=trace_id,
+                )
+        except Exception as e:
+            log_error(trace_id, "CloudWatch metric error for S3 upload", exc=e)
+            publish_error_metric("LambdaFileTransfer", "S3UploadMetricError", trace_id)
+
+    if is_dry_run_enabled():
+        transfer_status["sftp_move"] = f"DRY_RUN ({', '.join(files)})"
+        transfer_status["s3"] = f"DRY_RUN ({', '.join(files)})"
+    else:
+        transfer_status["sftp_move"] = f"SUCCESS ({', '.join(files)})"
+        transfer_status["s3"] = f"SUCCESS ({', '.join(files)})"
+
 
 def lambda_handler(event, context):
+    """
+    Lambda entry point for Salesforce LTI -> Unitrax move.
+
+    Behaviour:
+      - Connects once to sftp.ninepoint.com (or configured host).
+      - Reads all files in SRC_REMOTE_DIR that match FILE_PATTERN.
+      - Downloads them into /tmp.
+      - Uploads the same files into DEST_REMOTE_DIR on the SAME SFTP server.
+      - Uploads the files into S3 under S3_BUCKET/S3_PREFIX/YYYY/MM/DD/.
+      - Optionally deletes the files from SRC_REMOTE_DIR (DELETE_SOURCE=true|false).
+      - Sends an SNS summary using send_file_transfer_sns_alert.
+    """
     trace_id = get_or_create_trace_id(context)
-    job_id = trace_id
-    file_patterns = get_file_patterns()
+    job_id = getattr(context, "aws_request_id", "N/A")
+    file_patterns = _get_file_patterns()
+
     log_job_start(trace_id, job_id, file_patterns)
 
-    src_secret_name = os.getenv('SRC_SECRET_NAME')
-    box_secret_name = os.getenv('BOX_SECRET_NAME')
-    box_folder_id = os.getenv('BOX_FOLDER_ID')
-
-    s3_bucket = os.getenv('S3_BUCKET', 'jams-ftp-process-bucket')
-    s3_prefix = os.getenv('S3_PREFIX', 'ftp-listings')
+    # Environment configuration
+    secret_name = os.getenv("SFTP_SECRET_NAME")
+    src_remote_dir = os.getenv("SRC_REMOTE_DIR", "/lti/prod")
+    dest_remote_dir = os.getenv("DEST_REMOTE_DIR", "/npunitrax")
+    s3_bucket = os.getenv("S3_BUCKET")
+    s3_prefix = os.getenv("S3_PREFIX", "salesforce")
     sns_topic_arn = os.getenv("SNS_TOPIC_ARN")
 
-    src_secret = get_secret(src_secret_name)
-    src_host = src_secret['Host']
-    src_user = src_secret['Username']
-    src_pass = src_secret['Password']
-    src_dir = os.getenv('SRC_REMOTE_DIR', '.')
+    if not secret_name:
+        raise RuntimeError("SFTP_SECRET_NAME environment variable is required")
+    if not s3_bucket:
+        raise RuntimeError("S3_BUCKET environment variable is required")
 
-    box_jwt_config = get_secret(box_secret_name)
-    auth = JWTAuth(
-        client_id=box_jwt_config['boxAppSettings']['clientID'],
-        client_secret=box_jwt_config['boxAppSettings']['clientSecret'],
-        enterprise_id=box_jwt_config['enterpriseID'],
-        jwt_key_id=box_jwt_config['boxAppSettings']['appAuth']['publicKeyID'],
-        rsa_private_key_data=box_jwt_config['boxAppSettings']['appAuth']['privateKey'],
-        rsa_private_key_passphrase=box_jwt_config['boxAppSettings']['appAuth']['passphrase'].encode('utf-8'),
-    )
-    box_client = Client(auth)
+    # Fetch SFTP credentials
+    secret = _get_secret_dict(secret_name)
+    host = secret.get("Host") or secret.get("host")
+    username = secret.get("Username") or secret.get("username")
+    password = secret.get("Password") or secret.get("password")
 
-    metrics = {}
-    transfer_status = {}
-    checksum_status = {}
-    errors = []
-    warnings = []
+    if not all([host, username, password]):
+        raise RuntimeError("Secret for SFTP must contain Host, Username and Password fields.")
+
+    metrics: dict = {}
+    transfer_status: dict = {}
+    checksum_status: dict = {}
+    errors: list = []
+    warnings: list = []
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         free_mb = shutil.disk_usage(tmp_dir).free // (1024 * 1024)
         log_tmp_usage(trace_id, len(os.listdir(tmp_dir)), free_mb)
 
-        src_sftp = create_sftp_client(src_host, 22, src_user, src_pass)
-        log_sftp_connection(trace_id, src_host, "OPENED")
+        # Connect to SFTP server once
+        sftp_client = _create_sftp_client(host, 22, username, password)
+        log_sftp_connection(trace_id, host, "OPENED")
 
-        # SFTP -> S3
-        download_and_upload_to_s3(
-            src_sftp, src_dir, s3_bucket, s3_prefix, tmp_dir, trace_id, job_id,
-            file_patterns, metrics, transfer_status, checksum_status, errors, warnings
-        )
-        src_sftp.close()
-        log_sftp_connection(trace_id, src_host, "CLOSED")
-
-        free_mb = shutil.disk_usage(tmp_dir).free // (1024 * 1024)
-        log_tmp_usage(trace_id, len(os.listdir(tmp_dir)), free_mb)
-
-        # Local -> Box
-        box_files = match_files(os.listdir(tmp_dir), include_patterns=file_patterns)
-        unmatched = set(os.listdir(tmp_dir)) - set(box_files)
-        log_matched_files(trace_id, box_files, unmatched)
         try:
-            if box_files:
-                box_tmp_dir = os.path.join(tmp_dir, "boxonly")
-                os.makedirs(box_tmp_dir, exist_ok=True)
-                for fname in box_files:
-                    shutil.copy2(os.path.join(tmp_dir, fname), os.path.join(box_tmp_dir, fname))
-                box_total_bytes = sum(os.path.getsize(os.path.join(box_tmp_dir, f)) for f in box_files)
-                t0 = time.time()
-                if is_dry_run_enabled():
-                    log_dry_run_action(f"Would upload files {[f for f in os.listdir(box_tmp_dir)]} to Box folder {box_folder_id}")
-                else:
-                    upload_files_to_box_by_date(box_client, box_folder_id, box_tmp_dir, context)
-                    t1 = time.time()
-                    box_upload_time = t1 - t0
-                    box_mb = box_total_bytes / 1024 / 1024 if box_total_bytes else 0.0
-                    box_mbps = (box_mb / box_upload_time) if box_upload_time else 0.0
-                    metrics["Box upload speed mb/s"] = f"{box_mbps:.2f}"
-                    metrics["Box total mb"] = f"{box_mb:.2f}"
-                    transfer_status["box"] = f"SUCCESS ({', '.join(box_files)})"
-                    for fname in box_files:
-                        log_box_version(trace_id, fname, "box_id", "box_version")
-                    log_file_transferred(trace_id, f"{len(box_files)} file(s)", "Box", box_upload_time, box_mbps)
-            else:
-                warnings.append("No files matched FILE_PATTERN for Box, skipping Box upload.")
-                transfer_status["box"] = "NO FILES"
-        except Exception as e:
-            errors.append(f"Box upload failed: {e}")
-            transfer_status["box"] = f"FAILED ({e})"
+            _process_files_on_sftp(
+                sftp_client,
+                src_remote_dir,
+                dest_remote_dir,
+                s3_bucket,
+                s3_prefix,
+                tmp_dir,
+                trace_id,
+                file_patterns,
+                metrics,
+                transfer_status,
+                checksum_status,
+                errors,
+                warnings,
+            )
+        finally:
+            sftp_client.close()
+            log_sftp_connection(trace_id, host, "CLOSED")
 
         free_mb = shutil.disk_usage(tmp_dir).free // (1024 * 1024)
         log_tmp_usage(trace_id, len(os.listdir(tmp_dir)), free_mb)
 
-    # Send SNS Alert (always runs, even for dry run)
-    send_file_transfer_sns_alert(
-        sns_topic_arn, trace_id,
-        transfer_status=transfer_status,
-        checksum_status=checksum_status,
-        errors=errors,
-        warnings=warnings,
-        function_name="lambda_handler"
-    )
+    # Send SNS summary (if configured)
+    if sns_topic_arn:
+        try:
+            send_file_transfer_sns_alert(
+                sns_topic_arn,
+                trace_id,
+                transfer_status=transfer_status,
+                checksum_status=checksum_status,
+                errors=errors,
+                warnings=warnings,
+                function_name=(context.function_name if context else "lambda_handler"),
+            )
+        except Exception as e:
+            log_error(trace_id, "Failed to send SNS alert", exc=e)
+    else:
+        log_warning(trace_id, "SNS_TOPIC_ARN is not set; skipping SNS alert.")
 
     log_job_end(trace_id, job_id)
+
+    body = {
+        "message": "Files processed from src to dest SFTP and S3.",
+        "trace_id": trace_id,
+        "transfer_status": transfer_status,
+        "checksum_status": checksum_status,
+        "errors": errors,
+        "warnings": warnings,
+        "metrics": metrics,
+    }
+
     return {
-        'statusCode': 200,
-        'body': json.dumps({'message': 'Files transferred successfully to all destinations.', 'trace_id': trace_id})
+        "statusCode": 200,
+        "body": json.dumps(body),
     }
